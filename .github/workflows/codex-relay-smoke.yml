@@ -11,6 +11,9 @@ on:
 permissions:
   contents: read
 
+env:
+  PYTHONDONTWRITEBYTECODE: "1"
+
 concurrency:
   group: codex-relay-smoke
   cancel-in-progress: false
@@ -180,7 +183,7 @@ jobs:
           responses-api-endpoint: http://127.0.0.1:8787/v1/responses
           model: ${{ secrets.AGENT_MODEL }}
           prompt-file: .agent/tasks/SMOKE-001.md
-          output-file: codex-result.json
+          output-file: smoke/codex-result.json
           output-schema-file: .agent/schemas/codex-smoke-result.schema.json
           working-directory: smoke
           sandbox: workspace-write
