@@ -173,13 +173,14 @@ jobs:
 
       - name: T2 run Codex Thin Worker
         id: run-codex
+        continue-on-error: true
         uses: openai/codex-action@v1
         with:
           openai-api-key: ${{ secrets.AGENT_API_KEY }}
           responses-api-endpoint: http://127.0.0.1:8787/v1/responses
           model: ${{ secrets.AGENT_MODEL }}
           prompt-file: .agent/tasks/SMOKE-001.md
-          output-file: smoke/codex-result.json
+          output-file: codex-result.json
           output-schema-file: .agent/schemas/codex-smoke-result.schema.json
           working-directory: smoke
           sandbox: workspace-write
@@ -195,39 +196,67 @@ jobs:
           fi
 
       - name: T2 deterministic result and scope verification
+        id: verify-codex
+        continue-on-error: true
         run: python scripts/verify_codex_smoke.py
 
-      - name: Build minimal patch
+      - name: Build minimal patch when verification passes
+        if: steps.run-codex.outcome == 'success' && steps.verify-codex.outcome == 'success'
         shell: bash
         run: |
           set -euo pipefail
           git diff --binary -- smoke/output.txt > smoke/codex.patch
           test -s smoke/codex.patch
 
-      - name: Prepare safe handoff artifact
+      - name: Capture and audit safe worker diagnostics
+        if: always()
         shell: bash
         env:
           AGENT_RESPONSES_ENDPOINT: ${{ secrets.AGENT_RESPONSES_ENDPOINT }}
           AGENT_API_KEY: ${{ secrets.AGENT_API_KEY }}
+          ACTION_OUTCOME: ${{ steps.run-codex.outcome }}
+          VERIFY_OUTCOME: ${{ steps.verify-codex.outcome }}
         run: |
           set -euo pipefail
-          cp smoke/codex.patch artifact/
-          cp smoke/codex-result.json artifact/
-          cp smoke/verification-summary.json artifact/
+          for path in \
+            smoke/codex.patch \
+            smoke/codex-result.json \
+            smoke/verification-summary.json; do
+            if [[ -f "$path" ]]; then
+              cp "$path" artifact/
+            fi
+          done
+
+          jq -n \
+            --arg action_outcome "$ACTION_OUTCOME" \
+            --arg verification_outcome "$VERIFY_OUTCOME" \
+            '{action_outcome: $action_outcome, verification_outcome: $verification_outcome}' \
+            > artifact/worker-state.json
+
           python scripts/verify_no_secret_leak.py \
-            artifact/codex.patch \
-            artifact/codex-result.json \
-            artifact/verification-summary.json \
+            artifact \
             --output artifact/leak-audit.json
 
-      - name: Upload safe Codex handoff only
+      - name: Upload safe Codex handoff and diagnostics only
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: codex-smoke-handoff-${{ github.run_id }}
           path: artifact/
-          if-no-files-found: warn
+          if-no-files-found: error
           retention-days: 7
+
+      - name: Enforce Codex and deterministic verification gates
+        if: always()
+        shell: bash
+        env:
+          ACTION_OUTCOME: ${{ steps.run-codex.outcome }}
+          VERIFY_OUTCOME: ${{ steps.verify-codex.outcome }}
+        run: |
+          set -euo pipefail
+          test "$ACTION_OUTCOME" = "success"
+          test "$VERIFY_OUTCOME" = "success"
+          test -s smoke/codex.patch
 
   publish:
     needs:
