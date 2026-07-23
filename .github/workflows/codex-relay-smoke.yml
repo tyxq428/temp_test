@@ -1,0 +1,354 @@
+name: Codex Relay Smoke T0-T6
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - .github/workflows/codex-relay-smoke.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: codex-relay-smoke
+  cancel-in-progress: false
+
+jobs:
+  connectivity:
+    if: github.actor == 'tyxq428'
+    runs-on: ubuntu-latest
+    environment: agent-runtime-test
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - name: Register secret, endpoint, host, and model masks
+        shell: bash
+        env:
+          ENDPOINT: ${{ secrets.AGENT_RESPONSES_ENDPOINT }}
+          API_KEY: ${{ secrets.AGENT_API_KEY }}
+          MODEL: ${{ secrets.AGENT_MODEL }}
+        run: |
+          set +x
+          python - <<'PY'
+          import base64
+          import os
+          from urllib.parse import quote, urlsplit
+
+          endpoint = os.environ["ENDPOINT"]
+          api_key = os.environ["API_KEY"]
+          model = os.environ["MODEL"]
+          parsed = urlsplit(endpoint)
+          values = {
+              endpoint,
+              endpoint.rstrip("/"),
+              parsed.netloc,
+              parsed.hostname or "",
+              api_key,
+              model,
+              quote(endpoint, safe=""),
+              quote(api_key, safe=""),
+              base64.b64encode(endpoint.encode()).decode(),
+              base64.b64encode(api_key.encode()).decode(),
+          }
+          for value in values:
+              if len(value) >= 3:
+                  print(f"::add-mask::{value}")
+          PY
+
+      - name: T0 secret-safe preflight
+        env:
+          AGENT_RESPONSES_ENDPOINT: ${{ secrets.AGENT_RESPONSES_ENDPOINT }}
+          AGENT_API_KEY: ${{ secrets.AGENT_API_KEY }}
+          AGENT_MODEL: ${{ secrets.AGENT_MODEL }}
+        run: python scripts/preflight.py
+
+      - name: T1 streaming Responses API handshake
+        env:
+          AGENT_RESPONSES_ENDPOINT: ${{ secrets.AGENT_RESPONSES_ENDPOINT }}
+          AGENT_API_KEY: ${{ secrets.AGENT_API_KEY }}
+          AGENT_MODEL: ${{ secrets.AGENT_MODEL }}
+        run: python scripts/responses_handshake.py
+
+      - name: Audit safe connectivity summaries
+        if: always()
+        env:
+          AGENT_RESPONSES_ENDPOINT: ${{ secrets.AGENT_RESPONSES_ENDPOINT }}
+          AGENT_API_KEY: ${{ secrets.AGENT_API_KEY }}
+        run: |
+          python scripts/verify_no_secret_leak.py \
+            smoke/preflight-summary.json \
+            smoke/handshake-summary.json \
+            --output smoke/connectivity-leak-audit.json
+
+      - name: Upload safe connectivity summaries only
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: relay-connectivity-${{ github.run_id }}
+          path: |
+            smoke/preflight-summary.json
+            smoke/handshake-summary.json
+            smoke/connectivity-leak-audit.json
+          if-no-files-found: warn
+          retention-days: 7
+
+  codex-thin-worker:
+    needs:
+      - connectivity
+    runs-on: ubuntu-latest
+    environment: agent-runtime-test
+    timeout-minutes: 20
+    permissions:
+      contents: read
+
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - name: Prepare empty safe artifact directory
+        run: mkdir -p artifact
+
+      - name: Register secret, endpoint, host, and model masks
+        shell: bash
+        env:
+          ENDPOINT: ${{ secrets.AGENT_RESPONSES_ENDPOINT }}
+          API_KEY: ${{ secrets.AGENT_API_KEY }}
+          MODEL: ${{ secrets.AGENT_MODEL }}
+        run: |
+          set +x
+          python - <<'PY'
+          import base64
+          import os
+          from urllib.parse import quote, urlsplit
+
+          endpoint = os.environ["ENDPOINT"]
+          api_key = os.environ["API_KEY"]
+          model = os.environ["MODEL"]
+          parsed = urlsplit(endpoint)
+          values = {
+              endpoint,
+              endpoint.rstrip("/"),
+              parsed.netloc,
+              parsed.hostname or "",
+              api_key,
+              model,
+              quote(endpoint, safe=""),
+              quote(api_key, safe=""),
+              base64.b64encode(endpoint.encode()).decode(),
+              base64.b64encode(api_key.encode()).decode(),
+          }
+          for value in values:
+              if len(value) >= 3:
+                  print(f"::add-mask::{value}")
+          PY
+
+      - name: T2 run Codex Thin Worker
+        id: run-codex
+        uses: openai/codex-action@v1
+        with:
+          openai-api-key: ${{ secrets.AGENT_API_KEY }}
+          responses-api-endpoint: ${{ secrets.AGENT_RESPONSES_ENDPOINT }}
+          model: ${{ secrets.AGENT_MODEL }}
+          prompt-file: .agent/tasks/SMOKE-001.md
+          output-file: smoke/codex-result.json
+          output-schema-file: .agent/schemas/codex-smoke-result.schema.json
+          working-directory: smoke
+          sandbox: workspace-write
+          safety-strategy: drop-sudo
+
+      - name: T2 deterministic result and scope verification
+        run: python scripts/verify_codex_smoke.py
+
+      - name: Build minimal patch
+        shell: bash
+        run: |
+          set -euo pipefail
+          git diff --binary -- smoke/output.txt > smoke/codex.patch
+          test -s smoke/codex.patch
+
+      - name: Prepare safe handoff artifact
+        shell: bash
+        env:
+          AGENT_RESPONSES_ENDPOINT: ${{ secrets.AGENT_RESPONSES_ENDPOINT }}
+          AGENT_API_KEY: ${{ secrets.AGENT_API_KEY }}
+        run: |
+          set -euo pipefail
+          cp smoke/codex.patch artifact/
+          cp smoke/codex-result.json artifact/
+          cp smoke/verification-summary.json artifact/
+          python scripts/verify_no_secret_leak.py \
+            artifact/codex.patch \
+            artifact/codex-result.json \
+            artifact/verification-summary.json \
+            --output artifact/leak-audit.json
+
+      - name: Upload safe Codex handoff only
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: codex-smoke-handoff-${{ github.run_id }}
+          path: artifact/
+          if-no-files-found: warn
+          retention-days: 7
+
+  publish:
+    needs:
+      - codex-thin-worker
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      pull-requests: write
+    outputs:
+      branch: ${{ steps.publish.outputs.branch }}
+      pr_url: ${{ steps.publish.outputs.pr_url }}
+
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Download secret-free handoff
+        uses: actions/download-artifact@v4
+        with:
+          name: codex-smoke-handoff-${{ github.run_id }}
+          path: artifact
+
+      - name: T3 verify and apply handoff
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json
+          from pathlib import Path
+
+          audit = json.loads(Path("artifact/leak-audit.json").read_text(encoding="utf-8"))
+          verification = json.loads(
+              Path("artifact/verification-summary.json").read_text(encoding="utf-8")
+          )
+          if audit.get("status") != "PASS":
+              raise SystemExit("secret-free handoff audit failed")
+          if verification.get("status") != "PASS":
+              raise SystemExit("Codex verification summary failed")
+          PY
+
+          git apply --index artifact/codex.patch
+          test "$(cat smoke/output.txt)" = "result=42"
+
+      - name: Push isolated branch and create Draft PR
+        id: publish
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          branch="smoke/codex-thin-worker-${GITHUB_RUN_ID}"
+          git checkout -b "$branch"
+          git config user.name "codex-thin-worker"
+          git config user.email "codex-thin-worker@users.noreply.github.com"
+          git commit -m "Validate Codex thin-worker handoff"
+          git push origin "HEAD:${branch}"
+
+          cat > /tmp/pr-body.md <<EOF
+          Isolated T0-T6 smoke-test change produced by a secret-separated Codex job.
+
+          - Source workflow run: ${GITHUB_RUN_ID}
+          - Secret-bearing job had read-only repository permissions.
+          - This publishing job had no relay URL, model, or API key.
+          - The patch is limited to \`smoke/output.txt\`.
+          EOF
+
+          pr_url=$(gh pr create \
+            --draft \
+            --base main \
+            --head "$branch" \
+            --title "Smoke: validate Codex thin-worker handoff" \
+            --body-file /tmp/pr-body.md)
+
+          echo "branch=$branch" >> "$GITHUB_OUTPUT"
+          echo "pr_url=$pr_url" >> "$GITHUB_OUTPUT"
+
+  expected-incident:
+    needs:
+      - publish
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+
+    steps:
+      - name: T6 simulate a controlled interruption
+        run: |
+          echo "EXPECTED_INCIDENT_SIMULATION=TRIGGERED"
+          exit 42
+
+  notify:
+    needs:
+      - connectivity
+      - codex-thin-worker
+      - publish
+      - expected-incident
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      issues: write
+      contents: read
+
+    steps:
+      - name: Create interruption and completion notification issue
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CONNECTIVITY_RESULT: ${{ needs.connectivity.result }}
+          CODEX_RESULT: ${{ needs.codex-thin-worker.result }}
+          PUBLISH_RESULT: ${{ needs.publish.result }}
+          INCIDENT_RESULT: ${{ needs.expected-incident.result }}
+          PR_URL: ${{ needs.publish.outputs.pr_url }}
+        run: |
+          set -euo pipefail
+
+          if [[ "$CONNECTIVITY_RESULT" == "success" \
+             && "$CODEX_RESULT" == "success" \
+             && "$PUBLISH_RESULT" == "success" \
+             && "$INCIDENT_RESULT" == "failure" ]]; then
+            classification="EXPECTED_INCIDENT_NOTIFICATION_PASS"
+          else
+            classification="REAL_PIPELINE_INTERRUPTION"
+          fi
+
+          title="[SMOKE][T0-T6][run ${GITHUB_RUN_ID}] ${classification}"
+          body=$(cat <<EOF
+          The smoke workflow reached a terminal state and generated this notification without exposing relay configuration.
+
+          - Workflow run: ${GITHUB_RUN_ID}
+          - Connectivity T0-T1: ${CONNECTIVITY_RESULT}
+          - Codex Thin Worker T2: ${CODEX_RESULT}
+          - Secret-free publish T3-T5: ${PUBLISH_RESULT}
+          - Controlled interruption T6: ${INCIDENT_RESULT}
+          - Classification: ${classification}
+          - Draft PR: ${PR_URL:-not-created}
+
+          Resume by reviewing the workflow run, the Draft PR, and the separate public-log audit issue.
+          EOF
+          )
+
+          jq -n \
+            --arg title "$title" \
+            --arg body "$body" \
+            '{title: $title, body: $body, assignees: ["tyxq428"]}' \
+            > /tmp/issue.json
+
+          gh api \
+            --method POST \
+            "/repos/${GITHUB_REPOSITORY}/issues" \
+            --input /tmp/issue.json \
+            > /dev/null
