@@ -149,12 +149,34 @@ jobs:
                   print(f"::add-mask::{value}")
           PY
 
+      - name: Start no-log localhost endpoint normalizer
+        shell: bash
+        env:
+          AGENT_RESPONSES_ENDPOINT: ${{ secrets.AGENT_RESPONSES_ENDPOINT }}
+        run: |
+          set -euo pipefail
+          nohup python scripts/private_responses_forwarder.py --port 8787 \
+            >/dev/null 2>&1 &
+          echo $! > /tmp/private-responses-forwarder.pid
+
+          for attempt in $(seq 1 20); do
+            if curl --silent --show-error --fail \
+              http://127.0.0.1:8787/health >/dev/null; then
+              echo "PRIVATE_ENDPOINT_NORMALIZER=READY"
+              exit 0
+            fi
+            sleep 0.5
+          done
+
+          echo "PRIVATE_ENDPOINT_NORMALIZER=FAILED"
+          exit 1
+
       - name: T2 run Codex Thin Worker
         id: run-codex
         uses: openai/codex-action@v1
         with:
           openai-api-key: ${{ secrets.AGENT_API_KEY }}
-          responses-api-endpoint: ${{ secrets.AGENT_RESPONSES_ENDPOINT }}
+          responses-api-endpoint: http://127.0.0.1:8787/v1/responses
           model: ${{ secrets.AGENT_MODEL }}
           prompt-file: .agent/tasks/SMOKE-001.md
           output-file: smoke/codex-result.json
@@ -162,6 +184,15 @@ jobs:
           working-directory: smoke
           sandbox: workspace-write
           safety-strategy: drop-sudo
+
+      - name: Stop private endpoint normalizer
+        if: always()
+        shell: bash
+        run: |
+          if [[ -f /tmp/private-responses-forwarder.pid ]]; then
+            kill "$(cat /tmp/private-responses-forwarder.pid)" 2>/dev/null || true
+            rm -f /tmp/private-responses-forwarder.pid
+          fi
 
       - name: T2 deterministic result and scope verification
         run: python scripts/verify_codex_smoke.py
