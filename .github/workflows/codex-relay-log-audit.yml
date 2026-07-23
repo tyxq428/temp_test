@@ -1,0 +1,162 @@
+name: Codex Relay Public Log Audit
+
+on:
+  workflow_run:
+    workflows:
+      - Codex Relay Smoke T0-T6
+    types:
+      - completed
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  scan-public-logs:
+    runs-on: ubuntu-latest
+    environment: agent-runtime-test
+    timeout-minutes: 10
+    outputs:
+      audit_status: ${{ steps.audit.outputs.audit_status }}
+      source_run_id: ${{ github.event.workflow_run.id }}
+
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - name: Register secret and endpoint masks
+        shell: bash
+        env:
+          ENDPOINT: ${{ secrets.AGENT_RESPONSES_ENDPOINT }}
+          API_KEY: ${{ secrets.AGENT_API_KEY }}
+        run: |
+          set +x
+          python - <<'PY'
+          import base64
+          import os
+          from urllib.parse import quote, urlsplit
+
+          endpoint = os.environ["ENDPOINT"]
+          api_key = os.environ["API_KEY"]
+          parsed = urlsplit(endpoint)
+          values = {
+              endpoint,
+              endpoint.rstrip("/"),
+              parsed.netloc,
+              parsed.hostname or "",
+              api_key,
+              quote(endpoint, safe=""),
+              quote(api_key, safe=""),
+              base64.b64encode(endpoint.encode()).decode(),
+              base64.b64encode(api_key.encode()).decode(),
+          }
+          for value in values:
+              if len(value) >= 8:
+                  print(f"::add-mask::{value}")
+          PY
+
+      - name: Download completed workflow logs privately
+        id: download
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_RUN_ID: ${{ github.event.workflow_run.id }}
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/source-run-logs
+          gh api \
+            -H "Accept: application/vnd.github+json" \
+            "/repos/${GITHUB_REPOSITORY}/actions/runs/${SOURCE_RUN_ID}/logs" \
+            > /tmp/source-run-logs.zip
+          unzip -q /tmp/source-run-logs.zip -d /tmp/source-run-logs
+          rm -f /tmp/source-run-logs.zip
+
+      - name: Audit downloaded logs without printing matches
+        id: audit
+        if: always()
+        shell: bash
+        env:
+          AGENT_RESPONSES_ENDPOINT: ${{ secrets.AGENT_RESPONSES_ENDPOINT }}
+          AGENT_API_KEY: ${{ secrets.AGENT_API_KEY }}
+        run: |
+          set +e
+          python scripts/verify_no_secret_leak.py \
+            /tmp/source-run-logs \
+            --output /tmp/log-audit-summary.json
+          rc=$?
+          set -e
+
+          if [[ "$rc" -eq 0 ]]; then
+            echo "audit_status=PASS" >> "$GITHUB_OUTPUT"
+          else
+            echo "audit_status=FAIL" >> "$GITHUB_OUTPUT"
+          fi
+
+          mkdir -p log-audit-artifact
+          if [[ -f /tmp/log-audit-summary.json ]]; then
+            cp /tmp/log-audit-summary.json log-audit-artifact/
+          else
+            printf '%s\n' '{"status":"FAIL","failure_class":"LOG_DOWNLOAD_OR_AUDIT_FAILED"}' \
+              > log-audit-artifact/log-audit-summary.json
+          fi
+
+      - name: Upload safe audit summary only
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: codex-public-log-audit-${{ github.event.workflow_run.id }}
+          path: log-audit-artifact/log-audit-summary.json
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Enforce no-public-secret-leak gate
+        if: always() && steps.audit.outputs.audit_status != 'PASS'
+        run: |
+          echo "PUBLIC_LOG_SECRET_AUDIT=FAIL"
+          exit 1
+
+  notify-log-audit:
+    needs:
+      - scan-public-logs
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      issues: write
+      contents: read
+
+    steps:
+      - name: Create log-audit notification issue
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          AUDIT_STATUS: ${{ needs.scan-public-logs.outputs.audit_status }}
+          SOURCE_RUN_ID: ${{ github.event.workflow_run.id }}
+        run: |
+          set -euo pipefail
+          status="${AUDIT_STATUS:-FAIL}"
+          title="[SMOKE][LOG-AUDIT][run ${SOURCE_RUN_ID}] ${status}"
+          body=$(cat <<EOF
+          Public workflow-log secret audit completed.
+
+          - Source workflow run: ${SOURCE_RUN_ID}
+          - Audit result: ${status}
+          - Checked secret forms: endpoint, host, key, URL-encoded and Base64 variants
+          - Raw logs were not uploaded or included in this issue.
+
+          A FAIL result blocks migration to the production repository.
+          EOF
+          )
+
+          jq -n \
+            --arg title "$title" \
+            --arg body "$body" \
+            '{title: $title, body: $body, assignees: ["tyxq428"]}' \
+            > /tmp/issue.json
+
+          gh api \
+            --method POST \
+            "/repos/${GITHUB_REPOSITORY}/issues" \
+            --input /tmp/issue.json \
+            > /dev/null
