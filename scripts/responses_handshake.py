@@ -7,6 +7,8 @@ import urllib.request
 from pathlib import Path
 from typing import Any
 
+from endpoint_utils import normalize_responses_endpoint
+
 EXPECTED = "RELAY_SMOKE_OK"
 
 
@@ -40,7 +42,7 @@ def write_summary(summary: dict[str, Any]) -> None:
 
 
 def main() -> int:
-    endpoint = os.environ["AGENT_RESPONSES_ENDPOINT"]
+    endpoint = normalize_responses_endpoint(os.environ["AGENT_RESPONSES_ENDPOINT"])
     api_key = os.environ["AGENT_API_KEY"]
     model = os.environ["AGENT_MODEL"]
 
