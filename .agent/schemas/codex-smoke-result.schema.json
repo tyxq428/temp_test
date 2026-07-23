@@ -1,0 +1,40 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "status": {
+      "type": "string",
+      "enum": ["PASS", "BLOCKED"]
+    },
+    "root_policy_ack": {
+      "type": "string"
+    },
+    "scoped_policy_ack": {
+      "type": "string"
+    },
+    "changed_files": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "maxItems": 4
+    },
+    "summary": {
+      "type": "string",
+      "maxLength": 300
+    },
+    "blocking_reason": {
+      "type": ["string", "null"],
+      "maxLength": 300
+    }
+  },
+  "required": [
+    "status",
+    "root_policy_ack",
+    "scoped_policy_ack",
+    "changed_files",
+    "summary",
+    "blocking_reason"
+  ]
+}
