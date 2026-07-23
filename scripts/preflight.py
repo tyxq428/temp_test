@@ -3,7 +3,8 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
-from urllib.parse import urlsplit
+
+from endpoint_utils import normalize_responses_endpoint
 
 
 def truthy(value: str | None) -> bool:
@@ -21,14 +22,15 @@ def main() -> int:
         "model_present": bool(model),
         "debug_disabled": not truthy(os.environ.get("ACTIONS_STEP_DEBUG"))
         and not truthy(os.environ.get("ACTIONS_RUNNER_DEBUG")),
+        "api_key_minimum_shape": len(api_key) >= 8,
     }
 
-    parsed = urlsplit(endpoint) if endpoint else None
-    checks["endpoint_is_https"] = bool(parsed and parsed.scheme == "https" and parsed.netloc)
-    checks["endpoint_is_responses_path"] = bool(
-        parsed and parsed.path.rstrip("/").endswith("/responses")
-    )
-    checks["api_key_minimum_shape"] = len(api_key) >= 8
+    try:
+        normalize_responses_endpoint(endpoint)
+    except ValueError:
+        checks["endpoint_normalizable_to_https_responses"] = False
+    else:
+        checks["endpoint_normalizable_to_https_responses"] = True
 
     status = "PASS" if all(checks.values()) else "FAIL"
     summary = {"status": status, "checks": checks}
