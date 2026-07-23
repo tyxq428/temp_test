@@ -1,0 +1,73 @@
+name: Controlled Incident Notification Smoke T6
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - .github/workflows/controlled-incident-smoke.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  controlled-interruption:
+    if: github.actor == 'tyxq428'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Simulate a confirmed human-attention interruption
+        run: |
+          echo "EXPECTED_CONTROLLED_INTERRUPTION=TRIGGERED"
+          exit 42
+
+  notify:
+    needs:
+      - controlled-interruption
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      issues: write
+      contents: read
+
+    steps:
+      - name: Create assigned T6 notification issue
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INCIDENT_RESULT: ${{ needs.controlled-interruption.result }}
+        run: |
+          set -euo pipefail
+          if [[ "$INCIDENT_RESULT" == "failure" ]]; then
+            classification="EXPECTED_CONTROLLED_INTERRUPTION_PASS"
+          else
+            classification="CONTROLLED_INTERRUPTION_TEST_FAILED"
+          fi
+
+          title="[SMOKE][T6][run ${GITHUB_RUN_ID}] ${classification}"
+          body=$(cat <<EOF
+          A deliberately interrupted workflow generated this assigned notification.
+
+          - Workflow run: ${GITHUB_RUN_ID}
+          - Controlled job result: ${INCIDENT_RESULT}
+          - Classification: ${classification}
+          - No relay URL, API key, model identifier, or Codex call was used by this workflow.
+
+          This validates the minimum GitHub notification path for FAILED, BLOCKED, WAITING_HUMAN, timed-out, or stale tasks.
+          EOF
+          )
+
+          jq -n \
+            --arg title "$title" \
+            --arg body "$body" \
+            '{title: $title, body: $body, assignees: ["tyxq428"]}' \
+            > /tmp/issue.json
+
+          gh api \
+            --method POST \
+            "/repos/${GITHUB_REPOSITORY}/issues" \
+            --input /tmp/issue.json \
+            > /dev/null
